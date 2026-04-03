@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+release/
+build/
+
+# Model files (downloaded at first launch — Issue 06)
+*.bin
+*.gguf
+*.onnx
+
+# Native build artifacts
+sidecar/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# npm cache
+.npm-cache/
+
+# Claude Code internals
+.claude/
+
+# Scratch / test audio
+output.pcm
+*.pcm
+
+# clangd index cache
+sidecar/.cache/

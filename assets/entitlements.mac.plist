@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Required for ScreenCaptureKit system audio capture (ADR-001 Section 2) -->
+  <key>com.apple.security.screen-capture</key>
+  <true/>
+
+  <!-- Hardened Runtime: allow JIT (required by Electron / V8) -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!-- Hardened Runtime: allow unsigned memory execution (required by Electron) -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+
+  <!-- Hardened Runtime: disable library validation (required for native .node addons) -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>
