@@ -189,6 +189,78 @@ elseif(WIN32)
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ONNX Runtime (Issue 07) — prebuilt binaries placed by scripts/download-model.sh
+#
+# Expected layout after download:
+#   sidecar/vendor/onnxruntime/
+#     include/onnxruntime_cxx_api.h   (and other headers)
+#     lib/libonnxruntime.dylib        (macOS)
+#     lib/onnxruntime.dll + .lib      (Windows)
+#
+# If the directory is absent, cmake-js will fail with a clear message.
+# ─────────────────────────────────────────────────────────────────────────────
+set(ORT_ROOT ${CMAKE_SOURCE_DIR}/vendor/onnxruntime)
+
+if(NOT EXISTS "${ORT_ROOT}/include/onnxruntime_cxx_api.h")
+  message(FATAL_ERROR
+    "ONNX Runtime not found at ${ORT_ROOT}.\n"
+    "Run:  bash scripts/download-model.sh\n"
+    "This downloads onnxruntime prebuilt binaries and the Silero VAD model.")
+endif()
+
+add_library(onnxruntime_lib SHARED IMPORTED GLOBAL)
+
+if(APPLE)
+  set_target_properties(onnxruntime_lib PROPERTIES
+    IMPORTED_LOCATION "${ORT_ROOT}/lib/libonnxruntime.dylib"
+  )
+elseif(WIN32)
+  set_target_properties(onnxruntime_lib PROPERTIES
+    IMPORTED_LOCATION "${ORT_ROOT}/lib/onnxruntime.dll"
+    IMPORTED_IMPLIB   "${ORT_ROOT}/lib/onnxruntime.lib"
+  )
+endif()
+
+target_include_directories(onnxruntime_lib INTERFACE "${ORT_ROOT}/include")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VADAddon — Silero VAD N-API addon (Issue 07)
+# Exports: class SileroVAD { process(frame: Buffer): number; reset(): void }
+# ─────────────────────────────────────────────────────────────────────────────
+add_library(VADAddon SHARED
+  vad/SileroVAD.cpp
+  vad/VADAddon.cpp
+  ${CMAKE_JS_SRC}
+)
+
+set_target_properties(VADAddon PROPERTIES
+  PREFIX ""
+  SUFFIX ".node"
+)
+
+target_include_directories(VADAddon PRIVATE
+  ${CMAKE_SOURCE_DIR}/vad
+  ${ORT_ROOT}/include
+)
+
+target_link_libraries(VADAddon
+  onnxruntime_lib
+  ${CMAKE_JS_LIB}
+)
+
+if(APPLE)
+  set_target_properties(VADAddon PROPERTIES MACOSX_RPATH TRUE)
+  # Embed the ORT dylib search path so the .node loads it at runtime
+  set_target_properties(VADAddon PROPERTIES
+    BUILD_RPATH "${ORT_ROOT}/lib"
+    INSTALL_RPATH "@loader_path"
+  )
+  target_compile_options(VADAddon PRIVATE -Wall -Wextra -Wno-unused-parameter)
+elseif(WIN32)
+  target_compile_options(VADAddon PRIVATE /W3 /WX-)
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # NormalizerAddon — standalone .node for the TypeScript integration test (Issue 05)
 # Not used in production; exposes normalize() as a synchronous N-API function.
 # ─────────────────────────────────────────────────────────────────────────────

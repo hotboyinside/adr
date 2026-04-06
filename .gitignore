@@ -6,10 +6,13 @@ dist/
 release/
 build/
 
-# Model files (downloaded at first launch — Issue 06)
+# Model files (downloaded at first launch — Issues 06, 07)
 *.bin
 *.gguf
 *.onnx
+
+# ONNX Runtime prebuilt binaries (downloaded by scripts/download-model.sh — Issue 07)
+sidecar/vendor/onnxruntime/
 
 # Native build artifacts
 sidecar/build/

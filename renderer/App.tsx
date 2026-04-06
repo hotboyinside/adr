@@ -1,21 +1,33 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { SidecarMessage } from '../src/sidecar/SidecarManager';
 import type { CaptureStatus, TranscriptLine } from '../src/session/SessionState';
+import type { GeneratedQuestion, SessionContext } from '../src/ai/AIModule';
+import type { MacOSPermissionState } from '../src/permissions/MacOSPermissions';
+import type { PermissionState } from '../electron/preload';
+import QuestionPanel from './components/QuestionPanel';
+import ConsentDialog from './components/ConsentDialog';
+import PermissionGate from './components/PermissionGate';
 
 // Extend Window to include the context-bridge API
 declare global {
   interface Window {
     transcribeAPI: {
-      startCapture(): Promise<void>;
-      stopCapture(): Promise<void>;
+      startSession(role: SessionContext['role']): Promise<void>;
+      stopSession(): Promise<void>;
+      getPermissionState(): Promise<PermissionState>;
+      acknowledgeConsent(): Promise<PermissionState>;
+      checkPermission(): Promise<{ permissionState: MacOSPermissionState }>;
+      openSystemSettings(): Promise<void>;
       onTranscript(callback: (msg: SidecarMessage) => void): () => void;
+      onQuestions(callback: (questions: GeneratedQuestion[]) => void): () => void;
+      getWsPort(): Promise<number>;
     };
   }
 }
 
 let lineCounter = 0;
 
-// ── Design tokens (mirrors CSS vars for inline styles) ───────────────────────
+// ── Design tokens ─────────────────────────────────────────────────────────────
 
 const COLOR: Record<CaptureStatus, string> = {
   idle:      'var(--status-idle)',
@@ -38,6 +50,13 @@ const STATUS_LABEL: Record<CaptureStatus, string> = {
   error:     'Error',
 };
 
+const ROLES: { value: SessionContext['role']; label: string }[] = [
+  { value: 'default',     label: 'Default'    },
+  { value: 'interviewer', label: 'Interviewer' },
+  { value: 'customer',    label: 'Customer'    },
+  { value: 'presenter',   label: 'Presenter'   },
+];
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function formatTime(s: number): string {
@@ -57,16 +76,31 @@ const WAVE_BARS = Array(16).fill(0);
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function App() {
-  const [status, setStatus]               = useState<CaptureStatus>('idle');
-  const [lines, setLines]                 = useState<TranscriptLine[]>([]);
-  const [lastError, setLastError]         = useState<string | null>(null);
-  const [sessionSeconds, setSessionSeconds] = useState(0);
-  const bottomRef  = useRef<HTMLDivElement>(null);
-  const timerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [status, setStatus]                   = useState<CaptureStatus>('idle');
+  const [lines, setLines]                     = useState<TranscriptLine[]>([]);
+  const [lastError, setLastError]             = useState<string | null>(null);
+  const [sessionSeconds, setSessionSeconds]   = useState(0);
+  const [role, setRole]                       = useState<SessionContext['role']>('default');
+  const [questions, setQuestions]             = useState<GeneratedQuestion[]>([]);
+  const [wsPort, setWsPort]                   = useState<number | null>(null);
+  const [hasConsent, setHasConsent]           = useState<boolean | null>(null); // null = loading
+  const [permissionState, setPermissionState] = useState<MacOSPermissionState>('granted');
+  const [exclusiveModeModal, setExclusiveModeModal] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+  const timerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // IPC listener
+  // Bootstrap: load consent + permission state
   useEffect(() => {
-    return window.transcribeAPI.onTranscript((msg: SidecarMessage) => {
+    window.transcribeAPI.getPermissionState().then(({ hasShownConsent, permissionState: ps }) => {
+      setHasConsent(hasShownConsent);
+      setPermissionState(ps);
+    });
+    window.transcribeAPI.getWsPort().then(setWsPort);
+  }, []);
+
+  // IPC: transcript + question events
+  useEffect(() => {
+    const offTranscript = window.transcribeAPI.onTranscript((msg: SidecarMessage) => {
       if (msg.type === 'status') {
         setStatus(msg.value as CaptureStatus);
         setLastError(null);
@@ -74,7 +108,11 @@ export default function App() {
       }
       if (msg.type === 'error') {
         setStatus('error');
-        setLastError(`[${msg.code}] ${msg.message}`);
+        if (msg.code === 'EXCLUSIVE_MODE') {
+          setExclusiveModeModal(true);
+        } else {
+          setLastError(`[${msg.code}] ${msg.message}`);
+        }
         return;
       }
       const line: TranscriptLine = {
@@ -86,13 +124,19 @@ export default function App() {
         createdAt: Date.now(),
       };
       setLines(prev => {
-        const without = prev.filter(l => l.type !== 'partial');
+        const without = prev.filter(
+          l => !(l.type === 'partial' && l.startMs === line.startMs)
+        );
         return [...without, line];
       });
     });
+
+    const offQuestions = window.transcribeAPI.onQuestions(setQuestions);
+
+    return () => { offTranscript(); offQuestions(); };
   }, []);
 
-  // Session timer — counts up while capturing, resets on idle
+  // Session timer
   useEffect(() => {
     if (status === 'capturing') {
       timerRef.current = setInterval(() => setSessionSeconds(s => s + 1), 1000);
@@ -103,16 +147,22 @@ export default function App() {
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [status]);
 
-  // Auto-scroll to newest line
+  // Auto-scroll
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [lines]);
 
+  const handleConsent = async () => {
+    const { permissionState: ps } = await window.transcribeAPI.acknowledgeConsent();
+    setHasConsent(true);
+    setPermissionState(ps);
+  };
+
   const handleToggle = async () => {
     if (status === 'capturing') {
-      await window.transcribeAPI.stopCapture();
+      await window.transcribeAPI.stopSession();
     } else {
-      await window.transcribeAPI.startCapture();
+      await window.transcribeAPI.startSession(role);
     }
   };
 
@@ -122,14 +172,49 @@ export default function App() {
   const finalLines  = lines.filter(l => l.type === 'final');
   const words       = wordCount(lines);
 
+  // Show loading state until consent/permission are known
+  if (hasConsent === null) return null;
+
   return (
     <div style={s.root}>
+
+      {/* ── First-launch consent ─────────────────────────────────── */}
+      {!hasConsent && <ConsentDialog onContinue={handleConsent} />}
+
+      {/* ── EXCLUSIVE_MODE modal ─────────────────────────────────── */}
+      {exclusiveModeModal && (
+        <div style={s.overlay} role="dialog" aria-modal>
+          <div style={s.modalCard}>
+            <div style={s.modalIcon} aria-hidden>⚠</div>
+            <h3 style={s.modalTitle}>Audio device in exclusive mode</h3>
+            <p style={s.modalBody}>
+              Another application has exclusive control of your audio device.
+              Close any audio apps that may use exclusive mode (e.g. DAWs, games,
+              or audio interfaces) and try again.
+            </p>
+            <div style={s.modalActions}>
+              <button style={s.btnModalDismiss} onClick={() => setExclusiveModeModal(false)}>
+                Dismiss
+              </button>
+              <button
+                style={s.btnModalRetry}
+                onClick={async () => {
+                  setExclusiveModeModal(false);
+                  await window.transcribeAPI.startSession(role);
+                }}
+              >
+                Try Again
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Header ──────────────────────────────────────────────── */}
       <header style={s.header}>
         <div style={s.headerLeft}>
           <span style={s.appIcon} aria-hidden>◉</span>
-          <span style={s.appName}>Transcribe</span>
+          <span style={s.appName}>Verbatim</span>
         </div>
 
         <div style={s.headerRight}>
@@ -138,7 +223,6 @@ export default function App() {
               {formatTime(sessionSeconds)}
             </span>
           )}
-
           <div style={s.statusBadge} role="status" aria-live="polite">
             <span
               className={isCapturing || status === 'paused' ? 'dot-pulse' : ''}
@@ -181,58 +265,87 @@ export default function App() {
         )}
       </div>
 
-      {/* ── Transcript ──────────────────────────────────────────── */}
-      <main className="transcript-area" style={s.transcript}>
-        {lines.length === 0 ? (
-          <div style={s.emptyState}>
-            <div style={s.emptyIcon} aria-hidden>⌘</div>
-            <div style={s.emptyTitle}>Ready to transcribe</div>
-            <div style={s.emptySubtitle}>
-              Click <strong style={{ color: 'var(--text-secondary)' }}>Start Capturing</strong> to
-              begin recording system audio
-            </div>
-          </div>
-        ) : (
-          lines.map(line => (
-            <div
-              key={line.id}
-              className="line-enter"
-              style={{
-                ...s.line,
-                opacity: line.type === 'partial' ? 0.5 : 1,
-              }}
-            >
-              <time
-                dateTime={new Date(line.createdAt).toISOString()}
-                style={s.timestamp}
-              >
-                {new Date(line.createdAt).toLocaleTimeString([], {
-                  hour:   '2-digit',
-                  minute: '2-digit',
-                  second: '2-digit',
-                })}
-              </time>
-              <span
-                className={line.type === 'partial' ? 'partial-cursor' : ''}
-                style={s.lineText}
-              >
-                {line.text}
-              </span>
-            </div>
-          ))
-        )}
-        <div ref={bottomRef} />
-      </main>
+      {/* ── Content: transcript + question panel ─────────────────── */}
+      <div style={s.content}>
+        <main className="transcript-area" style={s.transcript}>
+          <PermissionGate
+            permissionState={permissionState}
+            onPermissionChange={setPermissionState}
+          >
+            {lines.length === 0 ? (
+              <div style={s.emptyState}>
+                <div style={s.emptyIcon} aria-hidden>⌘</div>
+                <div style={s.emptyTitle}>Ready to transcribe</div>
+                <div style={s.emptySubtitle}>
+                  Click{' '}
+                  <strong style={{ color: 'var(--text-secondary)' }}>Start Capturing</strong>{' '}
+                  to begin recording system audio
+                </div>
+              </div>
+            ) : (
+              lines.map(line => (
+                <div
+                  key={line.id}
+                  className="line-enter"
+                  style={{
+                    ...s.line,
+                    opacity: line.type === 'partial' ? 0.5 : 1,
+                  }}
+                >
+                  <time
+                    dateTime={new Date(line.createdAt).toISOString()}
+                    style={s.timestamp}
+                  >
+                    {new Date(line.createdAt).toLocaleTimeString([], {
+                      hour:   '2-digit',
+                      minute: '2-digit',
+                      second: '2-digit',
+                    })}
+                  </time>
+                  <span
+                    className={line.type === 'partial' ? 'partial-cursor' : ''}
+                    style={s.lineText}
+                  >
+                    {line.text}
+                  </span>
+                </div>
+              ))
+            )}
+          </PermissionGate>
+          <div ref={bottomRef} />
+        </main>
+
+        <QuestionPanel questions={questions} />
+      </div>
 
       {/* ── Footer ──────────────────────────────────────────────── */}
       <footer style={s.footer}>
-        <div style={s.footerStats} aria-live="polite">
-          {finalLines.length > 0
-            ? `${finalLines.length} ${finalLines.length === 1 ? 'line' : 'lines'} · ${words} ${words === 1 ? 'word' : 'words'}`
-            : 'No transcript yet'}
+        <div style={s.footerLeft}>
+          <div style={s.footerStats} aria-live="polite">
+            {finalLines.length > 0
+              ? `${finalLines.length} ${finalLines.length === 1 ? 'line' : 'lines'} · ${words} ${words === 1 ? 'word' : 'words'}`
+              : 'No transcript yet'}
+          </div>
+          {wsPort !== null && (
+            <span style={s.wsPort} title="WebSocket output">
+              ws://127.0.0.1:{wsPort}
+            </span>
+          )}
         </div>
 
         <div style={s.footerActions}>
+          {!isCapturing && (
+            <select
+              value={role}
+              onChange={e => setRole(e.target.value as SessionContext['role'])}
+              style={s.roleSelect}
+              aria-label="Session role"
+            >
+              {ROLES.map(r => (
+                <option key={r.value} value={r.value}>{r.label}</option>
+              ))}
+            </select>
+          )}
           {lines.length > 0 && !isCapturing && (
             <button
               className="btn-ghost"
@@ -271,38 +384,89 @@ const s: Record<string, React.CSSProperties> = {
     overflow:      'hidden',
   },
 
-  // ── Header
-  header: {
-    display:         'flex',
-    alignItems:      'center',
-    justifyContent:  'space-between',
-    padding:         '0 20px',
-    height:          52,
-    background:      'var(--surface)',
-    borderBottom:    '1px solid var(--border)',
-    flexShrink:      0,
+  // ── Modals
+  overlay: {
+    position:       'fixed',
+    inset:          0,
+    background:     'rgba(0,0,0,0.55)',
+    display:        'flex',
+    alignItems:     'center',
+    justifyContent: 'center',
+    zIndex:         100,
+    backdropFilter: 'blur(4px)',
   },
-  headerLeft: {
-    display:    'flex',
-    alignItems: 'center',
-    gap:        9,
+  modalCard: {
+    background:    'var(--surface)',
+    border:        '1px solid var(--border-bright)',
+    borderRadius:  14,
+    padding:       '28px 24px 20px',
+    maxWidth:      360,
+    width:         '90%',
+    display:       'flex',
+    flexDirection: 'column',
+    gap:           12,
+    boxShadow:     '0 24px 60px rgba(0,0,0,0.35)',
   },
-  appIcon: {
-    fontSize:   17,
-    color:      'var(--accent)',
-    lineHeight: 1,
-  },
-  appName: {
-    fontSize:      14,
+  modalIcon: { fontSize: 24, textAlign: 'center' as const },
+  modalTitle: {
+    fontSize:      15,
     fontWeight:    600,
     color:         'var(--text-primary)',
-    letterSpacing: '-0.01em',
+    margin:        0,
+    textAlign:     'center',
+    letterSpacing: '-0.015em',
   },
-  headerRight: {
-    display:    'flex',
-    alignItems: 'center',
-    gap:        14,
+  modalBody: {
+    fontSize:   13,
+    color:      'var(--text-secondary)',
+    lineHeight: 1.6,
+    margin:     0,
+    textAlign:  'center',
   },
+  modalActions: {
+    display:        'flex',
+    justifyContent: 'center',
+    gap:            8,
+    marginTop:      4,
+  },
+  btnModalDismiss: {
+    padding:      '8px 18px',
+    border:       '1px solid var(--border-bright)',
+    borderRadius: 8,
+    background:   'transparent',
+    color:        'var(--text-secondary)',
+    fontSize:     12,
+    fontWeight:   500,
+    cursor:       'pointer',
+    fontFamily:   'var(--font-ui)',
+  },
+  btnModalRetry: {
+    padding:      '8px 18px',
+    border:       'none',
+    borderRadius: 8,
+    background:   'var(--accent)',
+    color:        '#fff',
+    fontSize:     12,
+    fontWeight:   600,
+    cursor:       'pointer',
+    fontFamily:   'var(--font-ui)',
+  },
+
+  // ── Header
+  header: {
+    display:        'flex',
+    alignItems:     'center',
+    justifyContent: 'space-between',
+    padding:        '0 20px',
+    height:         52,
+    background:     'var(--surface)',
+    borderBottom:   '1px solid var(--border)',
+    flexShrink:     0,
+  },
+  headerLeft:  { display: 'flex', alignItems: 'center', gap: 9 },
+  appIcon:     { fontSize: 17, color: 'var(--accent)', lineHeight: 1 },
+  appName:     { fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', letterSpacing: '-0.01em' },
+  headerRight: { display: 'flex', alignItems: 'center', gap: 14 },
   sessionTimer: {
     fontFamily:    'var(--font-mono)',
     fontSize:      11,
@@ -319,62 +483,47 @@ const s: Record<string, React.CSSProperties> = {
     borderRadius: 20,
   },
   statusDot: {
-    width:        7,
-    height:       7,
-    borderRadius: '50%',
-    display:      'inline-block',
-    flexShrink:   0,
+    width: 7, height: 7, borderRadius: '50%', display: 'inline-block', flexShrink: 0,
   },
   statusText: {
-    fontSize:      11,
-    fontWeight:    600,
-    letterSpacing: '0.07em',
-    textTransform: 'uppercase',
+    fontSize: 11, fontWeight: 600, letterSpacing: '0.07em', textTransform: 'uppercase',
   },
 
-  // ── Waveform strip
+  // ── Waveform
   waveStrip: {
-    display:         'flex',
-    alignItems:      'center',
-    justifyContent:  'space-between',
-    padding:         '0 20px',
-    height:          44,
-    background:      'var(--surface)',
-    borderBottom:    '1px solid var(--border)',
-    flexShrink:      0,
+    display:        'flex',
+    alignItems:     'center',
+    justifyContent: 'space-between',
+    padding:        '0 20px',
+    height:         44,
+    background:     'var(--surface)',
+    borderBottom:   '1px solid var(--border)',
+    flexShrink:     0,
   },
-  waveContainer: {
-    display:    'flex',
-    alignItems: 'center',
-    gap:        3,
-    height:     '100%',
-  },
+  waveContainer: { display: 'flex', alignItems: 'center', gap: 3, height: '100%' },
   waveBar: {
-    width:        3,
-    height:       3,
-    borderRadius: 2,
-    display:      'inline-block',
-    flexShrink:   0,
-    transition:   'background 0.4s',
+    width: 3, height: 3, borderRadius: 2, display: 'inline-block',
+    flexShrink: 0, transition: 'background 0.4s',
   },
   errorPill: {
-    display:       'inline-flex',
-    alignItems:    'center',
-    gap:           6,
-    padding:       '4px 11px',
-    background:    'rgba(239,68,68,0.09)',
-    border:        '1px solid rgba(239,68,68,0.22)',
-    borderRadius:  20,
-    fontSize:      11,
-    color:         'var(--status-error)',
-    maxWidth:      380,
-    overflow:      'hidden',
-    textOverflow:  'ellipsis',
-    whiteSpace:    'nowrap',
-    cursor:        'default',
+    display:      'inline-flex',
+    alignItems:   'center',
+    gap:          6,
+    padding:      '4px 11px',
+    background:   'rgba(239,68,68,0.09)',
+    border:       '1px solid rgba(239,68,68,0.22)',
+    borderRadius: 20,
+    fontSize:     11,
+    color:        'var(--status-error)',
+    maxWidth:     380,
+    overflow:     'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace:   'nowrap',
+    cursor:       'default',
   },
 
-  // ── Transcript
+  // ── Content
+  content:    { flex: 1, display: 'flex', overflow: 'hidden' },
   transcript: {
     flex:          1,
     overflowY:     'auto',
@@ -393,31 +542,12 @@ const s: Record<string, React.CSSProperties> = {
     paddingTop:     48,
     userSelect:     'none',
   },
-  emptyIcon: {
-    fontSize:     30,
-    color:        'var(--text-muted)',
-    marginBottom: 2,
-  },
-  emptyTitle: {
-    fontSize:   14,
-    fontWeight: 500,
-    color:      'var(--text-secondary)',
-  },
-  emptySubtitle: {
-    fontSize:   12,
-    color:      'var(--text-muted)',
-    textAlign:  'center',
-    maxWidth:   260,
-    lineHeight: 1.6,
-  },
+  emptyIcon:     { fontSize: 30, color: 'var(--text-muted)', marginBottom: 2 },
+  emptyTitle:    { fontSize: 14, fontWeight: 500, color: 'var(--text-secondary)' },
+  emptySubtitle: { fontSize: 12, color: 'var(--text-muted)', textAlign: 'center', maxWidth: 260, lineHeight: 1.6 },
   line: {
-    display:    'flex',
-    gap:        16,
-    padding:    '5px 8px',
-    borderRadius: 6,
-    lineHeight: 1.65,
-    alignItems: 'baseline',
-    transition: 'background 0.12s',
+    display: 'flex', gap: 16, padding: '5px 8px', borderRadius: 6,
+    lineHeight: 1.65, alignItems: 'baseline', transition: 'background 0.12s',
   },
   timestamp: {
     fontFamily:    'var(--font-mono)',
@@ -429,34 +559,35 @@ const s: Record<string, React.CSSProperties> = {
     minWidth:      68,
   },
   lineText: {
-    fontFamily:    'var(--font-mono)',
-    fontSize:      13,
-    color:         'var(--text-primary)',
-    lineHeight:    1.65,
-    letterSpacing: '-0.01em',
+    fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--text-primary)',
+    lineHeight: 1.65, letterSpacing: '-0.01em',
   },
 
   // ── Footer
   footer: {
-    display:         'flex',
-    alignItems:      'center',
-    justifyContent:  'space-between',
-    padding:         '0 20px',
-    height:          52,
-    background:      'var(--surface)',
-    borderTop:       '1px solid var(--border)',
-    flexShrink:      0,
+    display:        'flex',
+    alignItems:     'center',
+    justifyContent: 'space-between',
+    padding:        '0 20px',
+    height:         52,
+    background:     'var(--surface)',
+    borderTop:      '1px solid var(--border)',
+    flexShrink:     0,
   },
-  footerStats: {
-    fontSize:           11,
-    color:              'var(--text-secondary)',
-    fontVariantNumeric: 'tabular-nums',
-    letterSpacing:      '0.02em',
-  },
-  footerActions: {
-    display:    'flex',
-    gap:        8,
-    alignItems: 'center',
+  footerLeft:  { display: 'flex', flexDirection: 'column', gap: 2 },
+  footerStats: { fontSize: 11, color: 'var(--text-secondary)', fontVariantNumeric: 'tabular-nums', letterSpacing: '0.02em' },
+  wsPort:      { fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.02em', userSelect: 'text', cursor: 'default' },
+  footerActions: { display: 'flex', gap: 8, alignItems: 'center' },
+  roleSelect: {
+    padding:    '5px 8px',
+    border:     '1px solid var(--border-bright)',
+    borderRadius: 7,
+    background: 'var(--surface-raised)',
+    color:      'var(--text-secondary)',
+    fontSize:   12,
+    fontFamily: 'var(--font-ui)',
+    cursor:     'pointer',
+    outline:    'none',
   },
   btnClear: {
     padding:      '6px 14px',

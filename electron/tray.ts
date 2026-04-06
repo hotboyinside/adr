@@ -1,5 +1,4 @@
 import { Tray, Menu, nativeImage, App, BrowserWindow } from 'electron';
-import path from 'path';
 import type { SidecarManager } from '../src/sidecar/SidecarManager';
 
 let tray: Tray | null = null;
@@ -7,12 +6,11 @@ let tray: Tray | null = null;
 export function setupTray(
   app: App,
   mainWindow: BrowserWindow | null,
-  sidecar: SidecarManager
-): void {
-  // Use a blank 16x16 image as placeholder — replace with real icon asset
+  sidecar: SidecarManager,
+): { updateCaptureState(isCapturing: boolean): void } {
   const icon = nativeImage.createEmpty();
   tray = new Tray(icon);
-  tray.setToolTip('Transcribe');
+  tray.setToolTip('Verbatim');
 
   const buildMenu = (isCapturing: boolean) =>
     Menu.buildFromTemplate([
@@ -36,10 +34,7 @@ export function setupTray(
         },
       },
       { type: 'separator' },
-      {
-        label: 'Quit',
-        click: () => app.quit(),
-      },
+      { label: 'Quit', click: () => app.quit() },
     ]);
 
   tray.setContextMenu(buildMenu(false));
@@ -48,4 +43,15 @@ export function setupTray(
     mainWindow?.show();
     mainWindow?.focus();
   });
+
+  function updateCaptureState(isCapturing: boolean): void {
+    tray?.setToolTip(isCapturing ? 'Verbatim — Capturing audio' : 'Verbatim');
+    tray?.setContextMenu(buildMenu(isCapturing));
+    // Set Dock badge on macOS
+    if (process.platform === 'darwin') {
+      app.dock?.setBadge(isCapturing ? '●' : '');
+    }
+  }
+
+  return { updateCaptureState };
 }
